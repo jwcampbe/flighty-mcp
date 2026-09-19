@@ -804,27 +804,49 @@ def add_flight(
         )
 
         # Insert UserFlight row
+        # Flighty's schema requires accountId (NOT NULL, part of the primary key).
+        # Reuse whatever this user's existing rows carry; fall back to 0.
+        _acct_row = conn.execute(
+            "SELECT accountId FROM UserFlight WHERE userId = ? LIMIT 1", [user_id]
+        ).fetchone()
+        account_id = _acct_row[0] if _acct_row else 0
+
         conn.execute(
             """
             INSERT INTO UserFlight (
-                userId, flightId, isRandom, isProUpgrade, isMyFlight,
+                accountId, userId, flightId, isRandom, isProUpgrade, isMyFlight,
                 isArchived, importSource, lastUpdated, created
-            ) VALUES (?, ?, 0, 0, 1, 0, 'MCP', ?, ?)
+            ) VALUES (?, ?, ?, 0, 0, 1, 0, 'MCP', ?, ?)
             """,
-            [user_id, flight_id, now_ts, now_ts],
+            [account_id, user_id, flight_id, now_ts, now_ts],
         )
 
         # Optionally insert Ticket row
         if seat_number or cabin_class or booking_reference:
-            conn.execute(
-                """
-                INSERT INTO Ticket (
-                    userId, flightId, seatNumber, seatPosition, cabinClass,
-                    pnr, lastUpdated
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?)
-                """,
-                [user_id, flight_id, seat_number, cabin_class, booking_reference, now_ts],
-            )
+            _ticket_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(Ticket)").fetchall()
+            }
+            if "accountId" in _ticket_cols:
+                conn.execute(
+                    """
+                    INSERT INTO Ticket (
+                        accountId, userId, flightId, seatNumber, seatPosition,
+                        cabinClass, pnr, lastUpdated
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    [account_id, user_id, flight_id, seat_number, cabin_class,
+                     booking_reference, now_ts],
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO Ticket (
+                        userId, flightId, seatNumber, seatPosition, cabinClass,
+                        pnr, lastUpdated
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    [user_id, flight_id, seat_number, cabin_class, booking_reference, now_ts],
+                )
 
         conn.commit()
 

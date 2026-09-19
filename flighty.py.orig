@@ -1,0 +1,894 @@
+"""Business logic for querying the Flighty local SQLite database."""
+
+import json
+import os
+import re
+import sqlite3
+import unicodedata
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone, tzinfo
+from functools import lru_cache
+from typing import Any
+from zoneinfo import ZoneInfo
+
+DEFAULT_DB_PATH = os.path.expanduser(
+    "~/Library/Containers/com.flightyapp.flighty/Data/Documents/MainFlightyDatabase.db"
+)
+
+DB_PATH = os.environ.get("FLIGHTY_DB_PATH", DEFAULT_DB_PATH)
+AIRLABS_API_KEY = os.environ.get("AIRLABS_API_KEY", "")
+
+
+def _get_db(readonly: bool = True) -> sqlite3.Connection:
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(
+            f"Flighty database not found at {DB_PATH}. "
+            "Make sure the Flighty app is installed."
+        )
+    mode = "ro" if readonly else "rw"
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode={mode}", uri=True)
+    conn.row_factory = sqlite3.Row
+    # Airport/airline names are stored accented ("Zürich"), but callers type
+    # plain ASCII ("Zurich"). Expose folding to SQL so LIKE matches both.
+    conn.create_function("unaccent", 1, _strip_accents, deterministic=True)
+    return conn
+
+
+def _strip_accents(value: str | None) -> str | None:
+    """Fold accented characters to ASCII ('Zürich' -> 'Zurich')."""
+    if value is None:
+        return None
+    decomposed = unicodedata.normalize("NFD", str(value))
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+
+
+def _ts_to_iso(ts: int | None) -> str | None:
+    """Convert a Unix timestamp (seconds) to ISO 8601 string."""
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _build_flight_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Build a clean flight dictionary from a joined query row."""
+    d = dict(row)
+    # Convert key timestamps to ISO
+    for key in [
+        "departureScheduleGateOriginal",
+        "departureScheduleGateEstimated",
+        "departureScheduleGateActual",
+        "departureScheduleRunwayOriginal",
+        "departureScheduleRunwayEstimated",
+        "departureScheduleRunwayActual",
+        "arrivalScheduleGateOriginal",
+        "arrivalScheduleGateEstimated",
+        "arrivalScheduleGateActual",
+        "arrivalScheduleRunwayOriginal",
+        "arrivalScheduleRunwayEstimated",
+        "arrivalScheduleRunwayActual",
+        "equipmentFirstFlightDate",
+        "checkInScheduleOpen",
+        "checkInScheduleClose",
+        "departureScheduleGateInitial",
+        "arrivalScheduleGateInitial",
+    ]:
+        if key in d and d[key] is not None:
+            d[key] = _ts_to_iso(d[key])
+    # The DB stores the bare number ("724"); expose the full code ("LX724") too,
+    # since that is what users and tool docstrings refer to.
+    number = d.get("flight_number")
+    iata = d.get("airline_iata")
+    if number:
+        d["flight_code"] = f"{iata}{number}" if iata else str(number)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Flight queries
+# ---------------------------------------------------------------------------
+
+# Flighty renamed Flight.arrivalWeatherCondition -> arrivalWeatherConditionName
+# in a recent app update. Detect which name the installed schema uses so both
+# old and new databases work. Ordered newest-first.
+_ARRIVAL_WEATHER_CANDIDATES = ("arrivalWeatherConditionName", "arrivalWeatherCondition")
+
+
+@lru_cache(maxsize=1)
+def _arrival_weather_column() -> str:
+    conn = _get_db()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(Flight)").fetchall()}
+    finally:
+        conn.close()
+    for name in _ARRIVAL_WEATHER_CANDIDATES:
+        if name in cols:
+            return name
+    return _ARRIVAL_WEATHER_CANDIDATES[0]
+
+
+@lru_cache(maxsize=1)
+def _archive_is_automatic() -> bool:
+    """Detect whether this Flighty version auto-archives past flights.
+
+    Older Flighty versions set UserFlight.isArchived = 1 on every flight once
+    it has flown, so treating "archived" as "hidden by the user" would exclude
+    all past flights. Newer versions only set the flag when the user manually
+    archives a flight. Heuristic: if essentially all past flights are archived,
+    archiving is automatic and the flag should not be used as a filter.
+    """
+    conn = _get_db()
+    try:
+        now = int(datetime.now(timezone.utc).timestamp())
+        past_total, past_archived = conn.execute(
+            """
+            SELECT COUNT(*), SUM(CASE WHEN uf.isArchived = 1 THEN 1 ELSE 0 END)
+            FROM UserFlight uf
+            JOIN Flight f ON uf.flightId = f.id
+            WHERE uf.deleted IS NULL AND f.deleted IS NULL
+              AND f.departureScheduleGateOriginal < ?
+            """,
+            [now],
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(past_total) and (past_archived or 0) / past_total >= 0.9
+
+
+def _flight_base_query() -> str:
+    return _FLIGHT_BASE_QUERY_TEMPLATE.format(
+        arrival_weather_col=_arrival_weather_column()
+    )
+
+
+_FLIGHT_BASE_QUERY_TEMPLATE = """
+SELECT
+    f.id,
+    f.number AS flight_number,
+    al.name AS airline_name,
+    al.iata AS airline_iata,
+    dep.iata AS departure_airport_iata,
+    dep.name AS departure_airport_name,
+    dep.city AS departure_city,
+    dep.country AS departure_country,
+    dep.timeZoneIdentifier AS departure_timezone,
+    f.departureTerminal AS departure_terminal,
+    f.departureGate AS departure_gate,
+    f.departureScheduleGateOriginal,
+    f.departureScheduleGateEstimated,
+    f.departureScheduleGateActual,
+    f.departureScheduleRunwayOriginal,
+    f.departureScheduleRunwayEstimated,
+    f.departureScheduleRunwayActual,
+    arr.iata AS arrival_airport_iata,
+    arr.name AS arrival_airport_name,
+    arr.city AS arrival_city,
+    arr.country AS arrival_country,
+    arr.timeZoneIdentifier AS arrival_timezone,
+    f.arrivalTerminal AS arrival_terminal,
+    f.arrivalGate AS arrival_gate,
+    f.arrivalBaggageBelt AS arrival_baggage_belt,
+    f.arrivalScheduleGateOriginal,
+    f.arrivalScheduleGateEstimated,
+    f.arrivalScheduleGateActual,
+    f.arrivalScheduleRunwayOriginal,
+    f.arrivalScheduleRunwayEstimated,
+    f.arrivalScheduleRunwayActual,
+    f.isCancelled AS is_cancelled,
+    f.distance AS distance_km,
+    f.equipmentTailNumber AS tail_number,
+    f.equipmentModelName AS aircraft_model,
+    f.equipmentManufacturer AS aircraft_manufacturer,
+    f.equipmentPlaneName AS aircraft_name,
+    f.equipmentCruisingSpeed AS cruising_speed_kmh,
+    f.{arrival_weather_col} AS arrival_weather,
+    f.arrivalWeatherTemperature AS arrival_temp_c,
+    f.delayForecastDelayMean AS delay_forecast_mean_min,
+    f.delayForecastObservations AS delay_forecast_observations,
+    f.delayForecastEarlyCount,
+    f.delayForecastOntimeCount,
+    f.delayForecastLate15Count,
+    f.delayForecastLate30Count,
+    f.delayForecastLate45Count,
+    f.delayForecastCanceledCount,
+    f.delayForecastDivertedCount,
+    f.checkInScheduleOpen,
+    f.checkInScheduleClose,
+    t.seatNumber AS seat_number,
+    t.seatPosition AS seat_position,
+    t.cabinClass AS cabin_class,
+    t.pnr AS booking_reference,
+    t.flightReason AS flight_reason,
+    uf.isArchived AS is_archived
+FROM Flight f
+JOIN Airport dep ON f.departureAirportId = dep.id
+JOIN Airport arr ON f.scheduledArrivalAirportId = arr.id
+JOIN Airline al ON f.airlineId = al.id
+JOIN UserFlight uf ON f.id = uf.flightId
+LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId
+WHERE uf.deleted IS NULL AND f.deleted IS NULL
+"""
+
+
+def list_flights(
+    upcoming_only: bool = False,
+    past_only: bool = False,
+    include_archived: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """List the owner's own flights (excludes friends' flights)."""
+    conn = _get_db()
+    owner_id = _get_owner_user_id(conn)
+    query = _flight_base_query() + " AND uf.userId = ?"
+    params: list[Any] = [owner_id]
+
+    if not include_archived and not _archive_is_automatic():
+        query += " AND uf.isArchived = 0"
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if upcoming_only:
+        query += " AND f.departureScheduleGateOriginal >= ?"
+        params.append(now)
+    elif past_only:
+        query += " AND f.departureScheduleGateOriginal < ?"
+        params.append(now)
+
+    query += " ORDER BY f.departureScheduleGateOriginal ASC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [_build_flight_dict(r) for r in rows]
+
+
+def list_friend_flights(
+    friend_name: str | None = None,
+    upcoming_only: bool = False,
+    past_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """List flights belonging to connected friends (excludes the owner's flights)."""
+    conn = _get_db()
+    owner_id = _get_owner_user_id(conn)
+
+    query = _flight_base_query().replace(
+        "LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId",
+        "LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId\n"
+        "LEFT JOIN Profile p ON uf.userId = p.userId",
+    )
+    query += " AND uf.userId != ?"
+    params: list[Any] = [owner_id]
+
+    if friend_name:
+        query += " AND (UPPER(p.fullName) LIKE UPPER(?) OR UPPER(p.firstName) LIKE UPPER(?))"
+        params.extend([f"%{friend_name}%", f"%{friend_name}%"])
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if upcoming_only:
+        query += " AND f.departureScheduleGateOriginal >= ?"
+        params.append(now)
+    elif past_only:
+        query += " AND f.departureScheduleGateOriginal < ?"
+        params.append(now)
+
+    # Add friend name to output
+    query = query.replace(
+        "SELECT\n    f.id,",
+        "SELECT\n    p.fullName AS friend_name,\n    f.id,",
+    )
+
+    query += " ORDER BY f.departureScheduleGateOriginal ASC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [_build_flight_dict(r) for r in rows]
+
+
+def get_flight(flight_id: str | None = None, flight_number: str | None = None) -> dict[str, Any] | None:
+    """Get a specific flight by ID or flight number (returns most recent match)."""
+    conn = _get_db()
+    query = _flight_base_query()
+
+    if flight_id:
+        query += " AND f.id = ?"
+        params = [flight_id]
+    elif flight_number:
+        # Flighty stores the bare number ("724"), but callers pass the full
+        # code ("LX724"). Match either form.
+        wanted = flight_number.strip().upper().replace("-", "").replace(" ", "")
+        query += (
+            " AND (UPPER(al.iata) || UPPER(REPLACE(f.number, ' ', '')) = ?"
+            " OR UPPER(REPLACE(f.number, ' ', '')) = ?)"
+        )
+        query += " ORDER BY f.departureScheduleGateOriginal DESC LIMIT 1"
+        params = [wanted, wanted]
+    else:
+        return None
+
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return _build_flight_dict(row) if row else None
+
+
+def search_flights(
+    airline: str | None = None,
+    departure_airport: str | None = None,
+    arrival_airport: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Search flights by airline, airports, or date range."""
+    conn = _get_db()
+    query = _flight_base_query()
+    params: list[Any] = []
+
+    if airline:
+        query += (
+            " AND (UPPER(al.iata) = UPPER(?)"
+            " OR unaccent(UPPER(al.name)) LIKE unaccent(UPPER(?)))"
+        )
+        params.extend([airline, f"%{airline}%"])
+    if departure_airport:
+        query += (
+            " AND (UPPER(dep.iata) = UPPER(?)"
+            " OR unaccent(UPPER(dep.city)) LIKE unaccent(UPPER(?)))"
+        )
+        params.extend([departure_airport, f"%{departure_airport}%"])
+    if arrival_airport:
+        query += (
+            " AND (UPPER(arr.iata) = UPPER(?)"
+            " OR unaccent(UPPER(arr.city)) LIKE unaccent(UPPER(?)))"
+        )
+        params.extend([arrival_airport, f"%{arrival_airport}%"])
+    if after:
+        ts = int(datetime.fromisoformat(after).timestamp())
+        query += " AND f.departureScheduleGateOriginal >= ?"
+        params.append(ts)
+    if before:
+        ts = int(datetime.fromisoformat(before).timestamp())
+        query += " AND f.departureScheduleGateOriginal <= ?"
+        params.append(ts)
+
+    query += " ORDER BY f.departureScheduleGateOriginal ASC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [_build_flight_dict(r) for r in rows]
+
+
+def get_flight_status(flight_number: str) -> dict[str, Any] | None:
+    """Get delay and status info for the most recent instance of a flight number."""
+    flight = get_flight(flight_number=flight_number)
+    if not flight:
+        return None
+
+    dep_orig = flight.get("departureScheduleGateOriginal")
+    dep_est = flight.get("departureScheduleGateEstimated")
+    arr_orig = flight.get("arrivalScheduleGateOriginal")
+    arr_est = flight.get("arrivalScheduleGateEstimated")
+
+    # Calculate delays
+    dep_delay_min = None
+    arr_delay_min = None
+    if dep_orig and dep_est:
+        try:
+            d1 = datetime.fromisoformat(dep_orig)
+            d2 = datetime.fromisoformat(dep_est)
+            dep_delay_min = int((d2 - d1).total_seconds() / 60)
+        except (ValueError, TypeError):
+            pass
+    if arr_orig and arr_est:
+        try:
+            d1 = datetime.fromisoformat(arr_orig)
+            d2 = datetime.fromisoformat(arr_est)
+            arr_delay_min = int((d2 - d1).total_seconds() / 60)
+        except (ValueError, TypeError):
+            pass
+
+    # Determine status
+    if flight.get("is_cancelled"):
+        status = "cancelled"
+    elif flight.get("departureScheduleGateActual") and flight.get("arrivalScheduleGateActual"):
+        status = "landed"
+    elif flight.get("departureScheduleGateActual"):
+        status = "in_air"
+    elif dep_delay_min and dep_delay_min > 15:
+        status = "delayed"
+    else:
+        status = "scheduled"
+
+    return {
+        "flight_number": flight.get("flight_code") or flight["flight_number"],
+        "status": status,
+        "is_cancelled": flight["is_cancelled"],
+        "departure_airport": flight["departure_airport_iata"],
+        "arrival_airport": flight["arrival_airport_iata"],
+        "departure_timezone": flight.get("departure_timezone"),
+        "arrival_timezone": flight.get("arrival_timezone"),
+        "scheduled_departure": dep_orig,
+        "estimated_departure": dep_est,
+        "actual_departure": flight.get("departureScheduleGateActual"),
+        "scheduled_arrival": arr_orig,
+        "estimated_arrival": arr_est,
+        "actual_arrival": flight.get("arrivalScheduleGateActual"),
+        "departure_delay_minutes": dep_delay_min,
+        "arrival_delay_minutes": arr_delay_min,
+        "departure_gate": flight.get("departure_gate"),
+        "arrival_gate": flight.get("arrival_gate"),
+        "arrival_baggage_belt": flight.get("arrival_baggage_belt"),
+        "arrival_weather": flight.get("arrival_weather"),
+        "arrival_temp_c": flight.get("arrival_temp_c"),
+        "delay_forecast_mean_min": flight.get("delay_forecast_mean_min"),
+        "aircraft": flight.get("aircraft_model"),
+        "tail_number": flight.get("tail_number"),
+    }
+
+
+def get_delay_forecast(flight_number: str) -> dict[str, Any] | None:
+    """Get historical delay statistics for a flight number."""
+    flight = get_flight(flight_number=flight_number)
+    if not flight:
+        return None
+
+    obs = flight.get("delay_forecast_observations") or 0
+    if obs == 0:
+        return {
+            "flight_number": flight.get("flight_code") or flight["flight_number"],
+            "message": "No delay forecast data available for this flight.",
+        }
+
+    return {
+        "flight_number": flight.get("flight_code") or flight["flight_number"],
+        "route": f"{flight['departure_airport_iata']} -> {flight['arrival_airport_iata']}",
+        "observations": obs,
+        "mean_delay_minutes": flight.get("delay_forecast_mean_min"),
+        "early_pct": round(100 * (flight.get("delayForecastEarlyCount") or 0) / obs, 1),
+        "ontime_pct": round(100 * (flight.get("delayForecastOntimeCount") or 0) / obs, 1),
+        "late_15_pct": round(100 * (flight.get("delayForecastLate15Count") or 0) / obs, 1),
+        "late_30_pct": round(100 * (flight.get("delayForecastLate30Count") or 0) / obs, 1),
+        "late_45_pct": round(100 * (flight.get("delayForecastLate45Count") or 0) / obs, 1),
+        "cancelled_pct": round(100 * (flight.get("delayForecastCanceledCount") or 0) / obs, 1),
+        "diverted_pct": round(100 * (flight.get("delayForecastDivertedCount") or 0) / obs, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Airport & Airline queries
+# ---------------------------------------------------------------------------
+
+
+def search_airports(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Search airports by IATA code, city, or name."""
+    conn = _get_db()
+    rows = conn.execute(
+        """
+        SELECT id, name, iata, icao, city, country, countryCode, timeZoneIdentifier,
+               latitude, longitude, website
+        FROM Airport
+        WHERE deleted IS NULL
+          AND (UPPER(iata) = UPPER(?)
+               OR UPPER(icao) = UPPER(?)
+               OR unaccent(UPPER(name)) LIKE unaccent(UPPER(?))
+               OR unaccent(UPPER(city)) LIKE unaccent(UPPER(?)))
+        ORDER BY relevance DESC
+        LIMIT ?
+        """,
+        [query, query, f"%{query}%", f"%{query}%", limit],
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def search_airlines(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Search airlines by IATA code, name, or alliance."""
+    conn = _get_db()
+    rows = conn.execute(
+        """
+        SELECT id, name, iata, icao, alliance, website, callsign, formattedPhone
+        FROM Airline
+        WHERE deleted IS NULL
+          AND (UPPER(iata) = UPPER(?)
+               OR UPPER(icao) = UPPER(?)
+               OR unaccent(UPPER(name)) LIKE unaccent(UPPER(?))
+               OR unaccent(UPPER(alliance)) LIKE unaccent(UPPER(?)))
+        ORDER BY relevance DESC
+        LIMIT ?
+        """,
+        [query, query, f"%{query}%", f"%{query}%", limit],
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+def get_flight_stats(year: int | None = None) -> dict[str, Any]:
+    """Get aggregate statistics about the user's flights."""
+    conn = _get_db()
+    owner_id = _get_owner_user_id(conn)
+    where = "WHERE uf.deleted IS NULL AND f.deleted IS NULL AND uf.userId = ?"
+    params: list[Any] = [owner_id]
+
+    if not _archive_is_automatic():
+        where += " AND uf.isArchived = 0"
+
+    if year:
+        start = int(datetime(year, 1, 1, tzinfo=timezone.utc).timestamp())
+        end = int(datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp())
+        where += " AND f.departureScheduleGateOriginal >= ? AND f.departureScheduleGateOriginal < ?"
+        params.extend([start, end])
+
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) as total_flights,
+            SUM(f.distance) as total_distance_km,
+            COUNT(DISTINCT dep.id) as unique_departure_airports,
+            COUNT(DISTINCT arr.id) as unique_arrival_airports,
+            COUNT(DISTINCT al.id) as unique_airlines,
+            COUNT(DISTINCT dep.country) + COUNT(DISTINCT arr.country) as approximate_countries,
+            SUM(CASE WHEN f.isCancelled THEN 1 ELSE 0 END) as cancelled_flights,
+            AVG(f.distance) as avg_distance_km
+        FROM Flight f
+        JOIN Airport dep ON f.departureAirportId = dep.id
+        JOIN Airport arr ON f.scheduledArrivalAirportId = arr.id
+        JOIN Airline al ON f.airlineId = al.id
+        JOIN UserFlight uf ON f.id = uf.flightId
+        {where}
+        """,
+        params,
+    ).fetchone()
+
+    # Top airlines
+    top_airlines = conn.execute(
+        f"""
+        SELECT al.name, al.iata, COUNT(*) as flight_count
+        FROM Flight f
+        JOIN Airline al ON f.airlineId = al.id
+        JOIN UserFlight uf ON f.id = uf.flightId
+        {where}
+        GROUP BY al.id
+        ORDER BY flight_count DESC
+        LIMIT 5
+        """,
+        params,
+    ).fetchall()
+
+    # Top routes
+    top_routes = conn.execute(
+        f"""
+        SELECT dep.iata || ' -> ' || arr.iata as route, COUNT(*) as flight_count
+        FROM Flight f
+        JOIN Airport dep ON f.departureAirportId = dep.id
+        JOIN Airport arr ON f.scheduledArrivalAirportId = arr.id
+        JOIN UserFlight uf ON f.id = uf.flightId
+        {where}
+        GROUP BY dep.id, arr.id
+        ORDER BY flight_count DESC
+        LIMIT 5
+        """,
+        params,
+    ).fetchall()
+
+    conn.close()
+
+    stats = dict(row)
+    if stats.get("total_distance_km"):
+        stats["total_distance_miles"] = round(stats["total_distance_km"] * 0.621371)
+        stats["avg_distance_miles"] = round((stats.get("avg_distance_km") or 0) * 0.621371)
+        stats["earth_circumnavigations"] = round(stats["total_distance_km"] / 40075, 2)
+
+    stats["top_airlines"] = [dict(r) for r in top_airlines]
+    stats["top_routes"] = [dict(r) for r in top_routes]
+    stats["year"] = year or "all_time"
+
+    return stats
+
+
+def _parse_flight_number(flight_code: str) -> tuple[str, str]:
+    """Parse a flight code like 'UA194' into (airline_iata, number).
+
+    Handles formats: 'UA194', 'UA 194', 'UA-194'.
+    """
+    code = flight_code.strip().upper().replace("-", "").replace(" ", "")
+    m = re.match(r"^([A-Z]{2}|\d[A-Z]|[A-Z]\d)(\d+)$", code)
+    if not m:
+        raise ValueError(
+            f"Invalid flight code '{flight_code}'. "
+            "Expected format like 'UA194' or 'BA930'."
+        )
+    return m.group(1), m.group(2)
+
+
+def _lookup_airline(conn: sqlite3.Connection, iata: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT id, name, iata FROM Airline WHERE UPPER(iata) = ? AND deleted IS NULL LIMIT 1",
+        [iata.upper()],
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Airline with IATA code '{iata}' not found in Flighty database.")
+    return dict(row)
+
+
+def _lookup_airport(conn: sqlite3.Connection, code: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT id, iata, name, timeZoneIdentifier FROM Airport WHERE UPPER(iata) = ? AND deleted IS NULL LIMIT 1",
+        [code.upper()],
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Airport with IATA code '{code}' not found in Flighty database.")
+    return dict(row)
+
+
+def _airport_timezone(airport: dict[str, Any]) -> tzinfo:
+    """Return an airport's local timezone from its IANA identifier.
+
+    Flighty's Airport table stores an IANA ``timeZoneIdentifier`` (e.g.
+    ``'America/New_York'``). Flight times must be interpreted in the airport's
+    own zone so they are stored as the correct UTC instant regardless of where
+    this server runs. Falls back to UTC if the identifier is missing or unknown.
+    """
+    tz_id = airport.get("timeZoneIdentifier")
+    if tz_id:
+        try:
+            return ZoneInfo(tz_id)
+        except Exception:
+            pass
+    return timezone.utc
+
+
+def _get_owner_user_id(conn: sqlite3.Connection) -> str:
+    """Get the local Flighty owner's user ID.
+
+    The owner appears in ConnectedFriendRelationship as both sender and receiver
+    more than any other user, but may not have a Profile entry with a name.
+    Fallback: the userId with the most UserFlight rows.
+    """
+    row = conn.execute(
+        """
+        SELECT userId, COUNT(*) as cnt FROM (
+            SELECT senderUserId AS userId FROM ConnectedFriendRelationship WHERE deleted IS NULL
+            UNION ALL
+            SELECT receiverUserId AS userId FROM ConnectedFriendRelationship WHERE deleted IS NULL
+        )
+        GROUP BY userId ORDER BY cnt DESC LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        return row[0]
+    # Fallback: user with the most flights
+    row = conn.execute(
+        "SELECT userId, COUNT(*) as cnt FROM UserFlight WHERE deleted IS NULL GROUP BY userId ORDER BY cnt DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        raise RuntimeError("Could not determine Flighty user ID.")
+    return row[0]
+
+
+def _lookup_flight_route(flight_iata: str) -> dict[str, str] | None:
+    """Look up flight route info from AirLabs API.
+
+    Returns dict with dep_iata, arr_iata, dep_time, arr_time or None on failure.
+    """
+    if not AIRLABS_API_KEY:
+        return None
+    try:
+        url = f"https://airlabs.co/api/v9/flight?flight_iata={flight_iata}&api_key={AIRLABS_API_KEY}"
+        req = urllib.request.Request(url, headers={"User-Agent": "flighty-mcp/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        r = data.get("response")
+        if r and r.get("dep_iata") and r.get("arr_iata"):
+            return {
+                "dep_iata": r["dep_iata"],
+                "arr_iata": r["arr_iata"],
+                "dep_time": r.get("dep_time"),
+                "arr_time": r.get("arr_time"),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def add_flight(
+    flight_code: str,
+    date: str,
+    departure_airport: str | None = None,
+    arrival_airport: str | None = None,
+    departure_time: str | None = None,
+    arrival_time: str | None = None,
+    seat_number: str | None = None,
+    cabin_class: str | None = None,
+    booking_reference: str | None = None,
+) -> dict[str, Any]:
+    """Add a flight to the Flighty database.
+
+    Args:
+        flight_code: Flight code (e.g. 'UA194', 'BA930').
+        date: Departure date in YYYY-MM-DD format.
+        departure_airport: Departure airport IATA code (e.g. 'SFO'). If omitted, looked up via AirLabs API.
+        arrival_airport: Arrival airport IATA code (e.g. 'LHR'). If omitted, looked up via AirLabs API.
+        departure_time: Optional departure time in HH:MM format (24h, departure airport local time). Defaults to '00:00'.
+        arrival_time: Optional arrival time in HH:MM format (24h, arrival airport local time). Defaults to departure + 3h.
+        seat_number: Optional seat number (e.g. '12A').
+        cabin_class: Optional cabin class (e.g. 'economy', 'business', 'first').
+        booking_reference: Optional PNR/booking reference.
+
+    Returns:
+        A dictionary with the created flight details.
+    """
+    airline_iata, flight_number = _parse_flight_number(flight_code)
+
+    # If airports not provided, try AirLabs API lookup
+    if not departure_airport or not arrival_airport:
+        route = _lookup_flight_route(airline_iata + flight_number)
+        if route:
+            departure_airport = departure_airport or route["dep_iata"]
+            arrival_airport = arrival_airport or route["arr_iata"]
+            if not departure_time and route.get("dep_time"):
+                # dep_time format: "2021-07-14 19:53"
+                try:
+                    departure_time = route["dep_time"].split(" ")[1][:5]
+                except (IndexError, TypeError):
+                    pass
+            if not arrival_time and route.get("arr_time"):
+                try:
+                    arrival_time = route["arr_time"].split(" ")[1][:5]
+                except (IndexError, TypeError):
+                    pass
+        if not departure_airport or not arrival_airport:
+            raise ValueError(
+                "Could not determine airports. Provide departure_airport and arrival_airport, "
+                "or set the AIRLABS_API_KEY environment variable for automatic lookup."
+            )
+
+    conn = _get_db(readonly=False)
+    try:
+        airline = _lookup_airline(conn, airline_iata)
+        dep_airport = _lookup_airport(conn, departure_airport)
+        arr_airport = _lookup_airport(conn, arrival_airport)
+        user_id = _get_owner_user_id(conn)
+
+        # Parse departure datetime in the departure airport's local timezone.
+        # Times are entered as local wall-clock times, so they must be localized
+        # before converting to a Unix timestamp; a naive .timestamp() would
+        # instead assume this machine's timezone and store the wrong instant.
+        dep_time = departure_time or "00:00"
+        dep_dt = datetime.fromisoformat(f"{date}T{dep_time}:00").replace(
+            tzinfo=_airport_timezone(dep_airport)
+        )
+        dep_ts = int(dep_dt.timestamp())
+
+        # Parse or estimate arrival datetime in the arrival airport's timezone.
+        if arrival_time:
+            arr_dt = datetime.fromisoformat(f"{date}T{arrival_time}:00").replace(
+                tzinfo=_airport_timezone(arr_airport)
+            )
+            # If arrival is before departure, assume next day. Both datetimes are
+            # timezone-aware, so this compares actual instants and stays correct
+            # across timezones (e.g. westbound flights arriving the "same" clock time).
+            if arr_dt <= dep_dt:
+                arr_dt += timedelta(days=1)
+            arr_ts = int(arr_dt.timestamp())
+        else:
+            arr_ts = dep_ts + 3 * 3600  # default: 3 hours later
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        flight_id = str(uuid.uuid4())
+
+        # Insert Flight row
+        conn.execute(
+            """
+            INSERT INTO Flight (
+                id, number, departureAirportId, scheduledArrivalAirportId,
+                actualArrivalAirportId, airlineId, isCancelled, hasOfficialData,
+                distance, lastKnownDepartureDate, lastKnownArrivalDate,
+                departureScheduleGateOriginal, arrivalScheduleGateOriginal,
+                created, lastUpdated
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, '0', 0, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                flight_id, flight_number, dep_airport["id"], arr_airport["id"],
+                arr_airport["id"], airline["id"],
+                dep_ts, arr_ts, dep_ts, arr_ts,
+                now_ts, now_ts,
+            ],
+        )
+
+        # Insert UserFlight row
+        conn.execute(
+            """
+            INSERT INTO UserFlight (
+                userId, flightId, isRandom, isProUpgrade, isMyFlight,
+                isArchived, importSource, lastUpdated, created
+            ) VALUES (?, ?, 0, 0, 1, 0, 'MCP', ?, ?)
+            """,
+            [user_id, flight_id, now_ts, now_ts],
+        )
+
+        # Optionally insert Ticket row
+        if seat_number or cabin_class or booking_reference:
+            conn.execute(
+                """
+                INSERT INTO Ticket (
+                    userId, flightId, seatNumber, seatPosition, cabinClass,
+                    pnr, lastUpdated
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+                """,
+                [user_id, flight_id, seat_number, cabin_class, booking_reference, now_ts],
+            )
+
+        conn.commit()
+
+        return {
+            "flight_id": flight_id,
+            "flight_number": flight_number,
+            "flight_code": f"{airline['iata']}{flight_number}",
+            "airline": airline["name"],
+            "departure_airport": dep_airport["iata"],
+            "arrival_airport": arr_airport["iata"],
+            "departure_timezone": dep_airport.get("timeZoneIdentifier"),
+            "arrival_timezone": arr_airport.get("timeZoneIdentifier"),
+            "departure_time": _ts_to_iso(dep_ts),
+            "arrival_time": _ts_to_iso(arr_ts),
+            "seat_number": seat_number,
+            "cabin_class": cabin_class,
+            "booking_reference": booking_reference,
+            "status": "created",
+        }
+    finally:
+        conn.close()
+
+
+def get_connections(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    """Get flight connections (layovers) for the user."""
+    conn = _get_db()
+    rows = conn.execute(
+        """
+        SELECT
+            c.id,
+            COALESCE(al_in.iata, '') || f_in.number AS inbound_flight,
+            dep_in.iata AS from_airport,
+            wait.iata AS connection_airport,
+            wait.name AS connection_airport_name,
+            wait.timeZoneIdentifier AS connection_timezone,
+            COALESCE(al_out.iata, '') || f_out.number AS onward_flight,
+            arr_out.iata AS to_airport,
+            f_in.arrivalScheduleGateOriginal AS arrival_time,
+            f_out.departureScheduleGateOriginal AS departure_time,
+            c.mctMinutes AS min_connection_time_min
+        FROM Connection c
+        JOIN Flight f_in ON c.arrivingFlightId = f_in.id
+        JOIN Flight f_out ON c.departingFlightId = f_out.id
+        JOIN Airport dep_in ON f_in.departureAirportId = dep_in.id
+        JOIN Airport arr_out ON f_out.scheduledArrivalAirportId = arr_out.id
+        JOIN Airport wait ON c.waitingAirportId = wait.id
+        LEFT JOIN Airline al_in ON f_in.airlineId = al_in.id
+        LEFT JOIN Airline al_out ON f_out.airlineId = al_out.id
+        WHERE c.deleted IS NULL
+        ORDER BY f_in.departureScheduleGateOriginal ASC
+        LIMIT ? OFFSET ?
+        """,
+        [limit, offset],
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        d = dict(r)
+        arr_ts = d.get("arrival_time")
+        dep_ts = d.get("departure_time")
+        if arr_ts and dep_ts:
+            d["layover_minutes"] = (dep_ts - arr_ts) // 60
+            d["arrival_time"] = _ts_to_iso(arr_ts)
+            d["departure_time"] = _ts_to_iso(dep_ts)
+        results.append(d)
+    return results
