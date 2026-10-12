@@ -186,47 +186,10 @@ def get_flight_stats(year: int | None = None) -> str:
     return formatting.format_flight_stats(stats)
 
 
-@mcp.tool(structured_output=False)
-def add_flight(
-    flight_code: str,
-    date: str,
-    departure_airport: str | None = None,
-    arrival_airport: str | None = None,
-    departure_time: str | None = None,
-    arrival_time: str | None = None,
-    seat_number: str | None = None,
-    cabin_class: str | None = None,
-    booking_reference: str | None = None,
-) -> str:
-    """Add a flight to Flighty by flight code and date.
-
-    The airline is automatically detected from the flight code prefix.
-    If departure/arrival airports are not provided and AIRLABS_API_KEY is set,
-    they are automatically looked up via the AirLabs API.
-
-    Args:
-        flight_code: Flight code (e.g. "UA194", "BA930", "LH400").
-        date: Departure date in YYYY-MM-DD format (e.g. "2026-04-15").
-        departure_airport: Departure airport IATA code (e.g. "SFO"). Auto-looked up if omitted.
-        arrival_airport: Arrival airport IATA code (e.g. "LHR"). Auto-looked up if omitted.
-        departure_time: Optional departure time in HH:MM 24h format, in the departure airport's local time (e.g. "14:30"). Defaults to midnight.
-        arrival_time: Optional arrival time in HH:MM 24h format, in the arrival airport's local time (e.g. "22:15"). Defaults to 3h after departure.
-        seat_number: Optional seat number (e.g. "12A").
-        cabin_class: Optional cabin class (e.g. "economy", "business", "first").
-        booking_reference: Optional PNR/booking reference code.
-    """
-    result = flighty.add_flight(
-        flight_code=flight_code,
-        date=date,
-        departure_airport=departure_airport,
-        arrival_airport=arrival_airport,
-        departure_time=departure_time,
-        arrival_time=arrival_time,
-        seat_number=seat_number,
-        cabin_class=cabin_class,
-        booking_reference=booking_reference,
-    )
-    return formatting.format_added_flight(result)
+# add_flight was removed 2026-10-12 at Joe's request: this server is READ-ONLY.
+# It used to INSERT straight into Flighty's own database behind the app's back;
+# a flight is added in the Flighty app, never from here. flighty._get_db now
+# refuses a writable connection, so the capability cannot come back by accident.
 
 
 @mcp.tool(structured_output=False)

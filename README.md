@@ -107,7 +107,6 @@ Override with the `FLIGHTY_DB_PATH` environment variable if needed.
 | `search_flights` | Search by airline, airports, date range |
 | `get_flight_status` | Current status, delays, gates, weather |
 | `get_delay_forecast` | Historical delay statistics |
-| `add_flight` | Add a flight by code and date (airports auto-resolved with AirLabs API key) |
 | `search_airports` | Search airports by code, city, or name |
 | `search_airlines` | Search airlines by code, name, or alliance |
 | `get_flight_stats` | Aggregate stats (distance, top routes, etc.) |
@@ -126,3 +125,13 @@ Override with the `FLIGHTY_DB_PATH` environment variable if needed.
 ## License
 
 MIT
+
+## On kvothe-stella (2026-10-12)
+
+- **Read-only.** `add_flight` is gone and `_get_db` refuses a writable connection.
+  Flights are added in the Flighty app.
+- **Runs as its own app, not through `uv`.** Built with
+  `~/Documents/Code/craneos/macos-apps/make-job-app.sh "CraneOS Flighty" me.craneos.flighty-mcp`;
+  `macos/point-claude-at-app.py` points Claude's config at it. Full Disk Access
+  belongs to **CraneOS Flighty** only (it reads Flighty's database inside the
+  app's container), so `uv` no longer needs it.

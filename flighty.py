@@ -21,13 +21,17 @@ AIRLABS_API_KEY = os.environ.get("AIRLABS_API_KEY", "")
 
 
 def _get_db(readonly: bool = True) -> sqlite3.Connection:
+    # READ-ONLY, ALWAYS (2026-10-12). This server never writes to Flighty's
+    # database: a writable connection is refused here, and the one caller that
+    # asked for it (add_flight) is no longer exposed as a tool.
+    if not readonly:
+        raise PermissionError("flighty-mcp is read-only: it does not write to Flighty's database")
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError(
             f"Flighty database not found at {DB_PATH}. "
             "Make sure the Flighty app is installed."
         )
-    mode = "ro" if readonly else "rw"
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode={mode}", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     # Airport/airline names are stored accented ("Zürich"), but callers type
     # plain ASCII ("Zurich"). Expose folding to SQL so LIKE matches both.
