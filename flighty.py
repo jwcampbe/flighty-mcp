@@ -203,7 +203,8 @@ SELECT
     t.cabinClass AS cabin_class,
     t.pnr AS booking_reference,
     t.flightReason AS flight_reason,
-    uf.isArchived AS is_archived
+    uf.isArchived AS is_archived,
+    uf.isMyFlight AS is_my_flight
 FROM Flight f
 JOIN Airport dep ON f.departureAirportId = dep.id
 JOIN Airport arr ON f.scheduledArrivalAirportId = arr.id
